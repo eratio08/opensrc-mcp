@@ -1,14 +1,58 @@
-import { join } from "node:path";
-import { mkdir } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { execFile } from "node:child_process";
+import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
+import { readFile } from "node:fs/promises";
+import { promisify } from "node:util";
+import { z } from "zod";
 import type { Source } from "./types.js";
-import { getGlobalOpensrcDir, getOpensrcCwd } from "./config.js";
-import {
-  listSources as opensrcListSources,
-  removePackageSource,
-  removeRepoSource,
-} from "opensrc/dist/lib/git.js";
-import type { Registry } from "opensrc/dist/types.js";
+import { getGlobalOpensrcDir } from "./config.js";
+
+const execFileAsync = promisify(execFile);
+const sourceIndexSchema = z.object({
+  packages: z
+    .array(
+      z.object({
+        name: z.string(),
+        version: z.string(),
+        registry: z.enum(["npm", "pypi", "crates"]),
+        path: z.string(),
+        fetchedAt: z.string(),
+      })
+    )
+    .default([]),
+  repos: z
+    .array(
+      z.object({
+        name: z.string(),
+        version: z.string(),
+        path: z.string(),
+        fetchedAt: z.string(),
+      })
+    )
+    .default([]),
+});
+
+export async function runOpensrc(
+  args: string[],
+  cwd = process.cwd()
+): Promise<void> {
+  const packageJson = createRequire(import.meta.url).resolve("opensrc/package.json");
+  const cliPath = join(dirname(packageJson), "bin", "opensrc.js");
+
+  try {
+    await execFileAsync(process.execPath, [cliPath, ...args], {
+      cwd,
+      env: {
+        ...process.env,
+        OPENSRC_HOME: getOpensrcDir(),
+      },
+      maxBuffer: 10 * 1024 * 1024,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`opensrc ${args.join(" ")} failed: ${message}`);
+  }
+}
 
 /**
  * Get path to global opensrc directory
@@ -18,24 +62,25 @@ export function getOpensrcDir(): string {
 }
 
 /**
- * Ensure opensrc directories exist
- */
-export async function ensureOpensrcDirs(): Promise<void> {
-  const opensrcDir = getOpensrcDir();
-  if (!existsSync(opensrcDir)) {
-    await mkdir(opensrcDir, { recursive: true });
-  }
-}
-
-/**
- * Read sources using opensrc's listSources and normalize to our Source type
+ * Read sources from opensrc's global index and normalize them to our Source type.
  */
 export async function readSources(): Promise<Source[]> {
-  const { packages, repos } = await opensrcListSources(getOpensrcCwd());
+  const sourcesPath = join(getOpensrcDir(), "sources.json");
+  let content: string;
+
+  try {
+    content = await readFile(sourcesPath, "utf8");
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      return [];
+    }
+    throw error;
+  }
+
+  const index = sourceIndexSchema.parse(JSON.parse(content));
   const sources: Source[] = [];
 
-  // Convert opensrc package format to our Source format
-  for (const pkg of packages) {
+  for (const pkg of index.packages) {
     sources.push({
       type: pkg.registry,
       name: pkg.name,
@@ -46,63 +91,18 @@ export async function readSources(): Promise<Source[]> {
     });
   }
 
-  // Convert opensrc repo format to our Source format
-  for (const repo of repos) {
+  for (const repo of index.repos) {
     sources.push({
       type: "repo",
       name: repo.name,
       ref: repo.version,
       path: repo.path.replace(/^opensrc\//, ""),
       fetchedAt: repo.fetchedAt,
-      repository: repo.name.startsWith("github.com")
-        ? `https://${repo.name}`
-        : `https://github.com/${repo.name}`,
+      repository: `https://${repo.name}`,
     });
   }
 
   return sources;
-}
-
-/**
- * Write sources - delegates to opensrc format
- * Note: opensrc manages its own sources.json during fetch/remove operations
- */
-export async function writeSources(sources: Source[]): Promise<void> {
-  // opensrc manages its own sources.json through its commands
-  // We only need to write if doing manual cleanup outside of opensrc
-  const sourcesPath = join(getOpensrcDir(), "sources.json");
-
-  // Read existing to preserve format
-  let existing = { packages: [] as unknown[], repos: [] as unknown[] };
-  if (existsSync(sourcesPath)) {
-    try {
-      const { readFile } = await import("node:fs/promises");
-      existing = JSON.parse(await readFile(sourcesPath, "utf8"));
-    } catch {
-      // use default
-    }
-  }
-
-  // Filter to only keep sources that still exist
-  const sourceNames = new Set(sources.map((s) => s.name));
-
-  existing.packages = (existing.packages ?? []).filter((p) => {
-    const pkg = p as { name?: string };
-    return sourceNames.has(pkg.name ?? "");
-  });
-  existing.repos = (existing.repos ?? []).filter((r) => {
-    const repo = r as { name?: string };
-    return sourceNames.has(repo.name ?? "");
-  });
-
-  // Update timestamp per opensrc format
-  const output = {
-    ...existing,
-    updatedAt: new Date().toISOString(),
-  };
-
-  const { writeFile } = await import("node:fs/promises");
-  await writeFile(sourcesPath, JSON.stringify(output, null, 2), "utf8");
 }
 
 /**
@@ -113,29 +113,17 @@ export async function removeSourcesByName(
   names: string[],
   currentSources: Source[]
 ): Promise<string[]> {
-  const removed: string[] = [];
-  const cwd = getOpensrcCwd();
+  const knownNames = names.filter((name) =>
+    currentSources.some((source) => source.name === name)
+  );
+  if (knownNames.length === 0) return [];
 
-  for (const name of names) {
-    const source = currentSources.find((s) => s.name === name);
-    if (!source) continue;
+  await runOpensrc(["remove", ...knownNames]);
+  const remainingSources = await readSources();
 
-    if (source.type === "repo") {
-      // Use opensrc's removeRepoSource
-      const success = await removeRepoSource(name, cwd);
-      if (success) {
-        removed.push(name);
-      }
-    } else {
-      // Use opensrc's removePackageSource (monorepo-aware)
-      const result = await removePackageSource(name, cwd, source.type as Registry);
-      if (result.removed) {
-        removed.push(name);
-      }
-    }
-  }
-
-  return removed;
+  return knownNames.filter(
+    (name) => !remainingSources.some((source) => source.name === name)
+  );
 }
 
 /**
@@ -151,19 +139,30 @@ export async function cleanSourcesFiltered(
     crates?: boolean;
   }
 ): Promise<string[]> {
-  const hasFilters = Object.values(options).some(Boolean);
+  const commands: string[][] = [];
 
-  const toRemove = currentSources.filter((s) => {
-    if (!hasFilters) return true; // clean all
+  if (options.packages) commands.push(["clean", "--packages"]);
+  if (options.repos) commands.push(["clean", "--repos"]);
 
-    if (options.packages && s.type !== "repo") return true;
-    if (options.repos && s.type === "repo") return true;
-    if (options.npm && s.type === "npm") return true;
-    if (options.pypi && s.type === "pypi") return true;
-    if (options.crates && s.type === "crates") return true;
+  if (!options.packages) {
+    if (options.npm) commands.push(["clean", "--npm"]);
+    if (options.pypi) commands.push(["clean", "--pypi"]);
+    if (options.crates) commands.push(["clean", "--crates"]);
+  }
 
-    return false;
-  });
+  if (commands.length === 0) commands.push(["clean"]);
+  for (const command of commands) {
+    await runOpensrc(command);
+  }
 
-  return removeSourcesByName(toRemove.map((s) => s.name), currentSources);
+  const remainingSources = await readSources();
+  return currentSources
+    .filter(
+      (source) =>
+        !remainingSources.some(
+          (remaining) =>
+            remaining.type === source.type && remaining.name === source.name
+        )
+    )
+    .map((source) => source.name);
 }

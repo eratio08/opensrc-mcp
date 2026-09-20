@@ -7,12 +7,10 @@ import {
   getOpensrcDir,
   removeSourcesByName,
   cleanSourcesFiltered,
-  writeSources,
   readSources,
+  runOpensrc,
 } from "../sources.js";
 import { getOpensrcCwd } from "../config.js";
-import { fetchCommand } from "opensrc/dist/commands/fetch.js";
-import { parsePackageSpec, detectInputType } from "opensrc/dist/lib/registries/index.js";
 import { createLogger } from "../logger.js";
 
 const log = createLogger("api");
@@ -68,13 +66,68 @@ function extractMetavars(
   return result;
 }
 
-interface OpensrcFetchResult {
-  package: string;
-  version: string;
-  path: string;
-  success: boolean;
-  error?: string;
-  registry?: "npm" | "pypi" | "crates";
+function parseSpec(spec: string): ParsedSpec {
+  const input = spec.trim();
+  const urlMatch = input.match(
+    /^https?:\/\/(github\.com|gitlab\.com|bitbucket\.org)\/([^/]+)\/([^/]+?)(?:\/(?:tree|blob)\/([^/]+))?\/?$/i
+  );
+
+  if (urlMatch) {
+    const host = urlMatch[1].toLowerCase();
+    const repo = urlMatch[3].replace(/\.git$/, "");
+    const name = `${host}/${urlMatch[2]}/${repo}`;
+    return {
+      type: "repo",
+      name,
+      ref: urlMatch[4],
+      repoUrl: `https://${name}`,
+    };
+  }
+
+  const repoMatch = input.match(
+    /^(?:(github|gitlab|bitbucket):)?(?:(github\.com|gitlab\.com|bitbucket\.org)\/)?([^/@]+)\/([^/#@]+?)(?:[@#](.+))?$/i
+  );
+  if (repoMatch && !input.startsWith("@")) {
+    const alias = repoMatch[1]?.toLowerCase();
+    const host =
+      repoMatch[2]?.toLowerCase() ??
+      (alias === "gitlab" ? "gitlab.com" : alias === "bitbucket" ? "bitbucket.org" : "github.com");
+    const name = `${host}/${repoMatch[3]}/${repoMatch[4]}`;
+    return {
+      type: "repo",
+      name,
+      ref: repoMatch[5],
+      repoUrl: `https://${name}`,
+    };
+  }
+
+  let type: ParsedSpec["type"] = "npm";
+  let name = input;
+  const prefix = name.match(/^(npm:|pypi:|pip:|python:|crates:|cargo:|rust:)/);
+  if (prefix) {
+    if (prefix[1] === "pypi:" || prefix[1] === "pip:" || prefix[1] === "python:") {
+      type = "pypi";
+    } else if (prefix[1] === "crates:" || prefix[1] === "cargo:" || prefix[1] === "rust:") {
+      type = "crates";
+    }
+    name = name.slice(prefix[1].length);
+  }
+
+  const equalsIndex = type === "pypi" ? name.indexOf("==") : -1;
+  const atIndex = name.startsWith("@")
+    ? name.indexOf("@", 1)
+    : name.lastIndexOf("@");
+  const separator = equalsIndex > 0 ? equalsIndex : atIndex;
+  if (separator > 0) {
+    const separatorLength = equalsIndex > 0 ? 2 : 1;
+    return {
+      type,
+      name: name.slice(0, separator),
+      version: name.slice(separator + separatorLength),
+    };
+  }
+
+  return { type, name };
 }
 
 export interface OpensrcAPI {
@@ -387,29 +440,7 @@ export function createOpensrcAPI(
       return matches;
     },
 
-    resolve: async (spec: string): Promise<ParsedSpec> => {
-      const inputType = detectInputType(spec);
-
-      if (inputType === "repo") {
-        const cleanSpec = spec
-          .replace(/^github:/, "")
-          .replace(/^https?:\/\/github\.com\//, "");
-        const [ownerRepo, ref] = cleanSpec.split("@");
-        return {
-          type: "repo",
-          name: `github.com/${ownerRepo}`,
-          ref,
-          repoUrl: `https://github.com/${ownerRepo}`,
-        };
-      }
-
-      const parsed = parsePackageSpec(spec);
-      return {
-        type: parsed.registry,
-        name: parsed.name,
-        version: parsed.version,
-      };
-    },
+    resolve: async (spec: string): Promise<ParsedSpec> => parseSpec(spec),
 
     // ── Mutation Operations ──────────────────────────────────────────────
 
@@ -418,52 +449,56 @@ export function createOpensrcAPI(
       options: { modify?: boolean; } = {}
     ): Promise<FetchedSource[]> => {
       const specList = Array.isArray(specs) ? specs : [specs];
-      log.info("fetch", { specs: specList, modify: options.modify });
+      if (options.modify) {
+        throw new Error("opensrc no longer supports project modifications");
+      }
+      log.info("fetch", { specs: specList });
 
-      const opensrcResults: OpensrcFetchResult[] = await fetchCommand(
-        specList,
-        {
-          cwd: getOpensrcCwd(),
-          allowModifications: options.modify ?? false,
-        }
-      );
-      log.debug("fetch results", { results: opensrcResults.map(r => ({ pkg: r.package, success: r.success })) });
+      const previousSources = getSources();
+      const cwd = getOpensrcCwd();
+      await runOpensrc(["fetch", "--quiet", "--cwd", cwd, ...specList], cwd);
 
       const newSources = await readSources();
       updateSources(newSources);
 
-      const results: FetchedSource[] = [];
-
-      for (const r of opensrcResults) {
-        if (!r.success) {
-          throw new Error(`Failed to fetch ${r.package}: ${r.error ?? "Unknown error"}`);
-        }
-
-        const source = newSources.find(
-          (s) => s.name === r.package || s.path.includes(r.package)
+      return specList.map((spec) => {
+        const parsed = parseSpec(spec);
+        const candidates = newSources.filter(
+          (candidate) =>
+            candidate.type === parsed.type && candidate.name === parsed.name
         );
+        const source =
+          candidates.find(
+            (candidate) =>
+              candidate.version === parsed.version ||
+              candidate.ref === parsed.ref
+          ) ?? candidates[0];
 
         if (!source) {
-          throw new Error(`Source not found after fetch: ${r.package}`);
+          throw new Error(`Source not found after fetch: ${spec}`);
         }
 
-        results.push({
-          source,
-          alreadyExists: false,
-        });
-      }
+        const previousSource = previousSources.find(
+          (candidate) =>
+            candidate.type === source.type &&
+            candidate.name === source.name &&
+            candidate.version === source.version &&
+            candidate.ref === source.ref
+        );
 
-      return results;
+        return {
+          source,
+          alreadyExists: previousSource !== undefined,
+        };
+      });
     },
 
     remove: async (names: string[]): Promise<RemoveResult> => {
       log.info("remove", { names });
-      const sources = getSources();
-      const removed = await removeSourcesByName(names, sources);
-      log.debug("remove complete", { removed });
-      const newSources = sources.filter((s) => !names.includes(s.name));
+      const removed = await removeSourcesByName(names, getSources());
+      const newSources = await readSources();
       updateSources(newSources);
-      await writeSources(newSources);
+      log.debug("remove complete", { removed });
       return { success: true, removed };
     },
 
@@ -476,11 +511,9 @@ export function createOpensrcAPI(
         crates?: boolean;
       } = {}
     ): Promise<RemoveResult> => {
-      const sources = getSources();
-      const removed = await cleanSourcesFiltered(sources, options);
-      const newSources = sources.filter((s) => !removed.includes(s.name));
+      const removed = await cleanSourcesFiltered(getSources(), options);
+      const newSources = await readSources();
       updateSources(newSources);
-      await writeSources(newSources);
       return { success: true, removed };
     },
 

@@ -2,7 +2,7 @@
 
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createServer } from "./server.js";
-import { readSources, writeSources, getOpensrcDir } from "./sources.js";
+import { readSources, getOpensrcDir } from "./sources.js";
 import type { Source } from "./types.js";
 import { createLogger, getLogPath } from "./logger.js";
 
@@ -33,8 +33,7 @@ async function main() {
   await server.connect(transport);
 
   // Handle graceful shutdown
-  const shutdown = async () => {
-    await writeSources(sources);
+  const shutdown = () => {
     process.exit(0);
   };
 

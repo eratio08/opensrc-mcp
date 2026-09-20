@@ -36,8 +36,12 @@ function send(method, params = {}) {
   });
 }
 
-function execute(code) {
-  return send("tools/call", { name: "execute", arguments: { code } });
+async function execute(code) {
+  const response = await send("tools/call", { name: "execute", arguments: { code } });
+  if (response.result?.isError) {
+    throw new Error(response.result.content?.[0]?.text ?? "MCP execution failed");
+  }
+  return response;
 }
 
 async function test(name, fn) {
@@ -95,10 +99,7 @@ async function main() {
     await test("opensrc.fetch('zod')", async () => {
       const res = await execute(`async () => {
         const result = await opensrc.fetch("zod");
-        return result.match({
-          ok: (f) => ({ fetched: f.map(x => x.source.name) }),
-          err: (e) => ({ error: e.message })
-        });
+        return { fetched: result.map(x => x.source.name) };
       }`);
       return res.result?.content?.[0]?.text;
     });
@@ -114,10 +115,7 @@ async function main() {
       const sources = opensrc.list();
       if (sources.length === 0) return "no sources";
       const result = await opensrc.files(sources[0].name, "**/*.ts");
-      return result.match({
-        ok: (files) => ({ count: files.length, sample: files.slice(0, 3).map(f => f.path) }),
-        err: (e) => ({ error: e.message })
-      });
+      return { count: result.length, sample: result.slice(0, 3).map(f => f.path) };
     }`);
     return res.result?.content?.[0]?.text;
   });
@@ -127,10 +125,7 @@ async function main() {
       const sources = opensrc.list();
       if (sources.length === 0) return "no sources";
       const result = await opensrc.read(sources[0].name, "package.json");
-      return result.match({
-        ok: (content) => ({ bytes: content.length, preview: content.slice(0, 100) }),
-        err: (e) => ({ error: e.message })
-      });
+      return { bytes: result.length, preview: result.slice(0, 100) };
     }`);
     return res.result?.content?.[0]?.text;
   });
@@ -139,62 +134,6 @@ async function main() {
     const res = await execute(`async () => {
       const results = await opensrc.grep("export", { include: "*.ts", maxResults: 5 });
       return { count: results.length, sample: results.slice(0, 2) };
-    }`);
-    return res.result?.content?.[0]?.text;
-  });
-
-  // ─────────────────────────────────────────────────────────────────────────
-  console.log("\n─ Testing Semantic Search (PRIORITY) ─");
-
-  await test("semanticSearch - basic", async () => {
-    const res = await execute(`async () => {
-      const results = await opensrc.semanticSearch("parse and validate data schema", { topK: 5 });
-      if ("error" in results) return results;
-      return {
-        count: results.length,
-        results: results.slice(0, 3).map(r => ({
-          source: r.source,
-          file: r.file,
-          identifier: r.identifier,
-          kind: r.kind,
-          score: r.score.toFixed(3)
-        }))
-      };
-    }`);
-    return res.result?.content?.[0]?.text;
-  });
-
-  await test("semanticSearch - error handling", async () => {
-    const res = await execute(`async () => {
-      const results = await opensrc.semanticSearch("error handling throw catch", { topK: 3 });
-      if ("error" in results) return results;
-      return {
-        count: results.length,
-        top: results[0] ? { file: results[0].file, id: results[0].identifier, score: results[0].score.toFixed(3) } : null
-      };
-    }`);
-    return res.result?.content?.[0]?.text;
-  });
-
-  await test("semanticSearch - type definitions", async () => {
-    const res = await execute(`async () => {
-      const results = await opensrc.semanticSearch("type interface definition", { topK: 5 });
-      if ("error" in results) return results;
-      return {
-        count: results.length,
-        kinds: [...new Set(results.map(r => r.kind))]
-      };
-    }`);
-    return res.result?.content?.[0]?.text;
-  });
-
-  await test("semanticSearch - with source filter", async () => {
-    const res = await execute(`async () => {
-      const sources = opensrc.list();
-      if (sources.length === 0) return "no sources";
-      const results = await opensrc.semanticSearch("validation", { sources: [sources[0].name], topK: 3 });
-      if ("error" in results) return results;
-      return { count: results.length, source: sources[0].name };
     }`);
     return res.result?.content?.[0]?.text;
   });
@@ -216,7 +155,7 @@ async function main() {
   console.log("\n═".repeat(60));
   console.log("Integration tests complete!");
   console.log("═".repeat(60));
-  console.log("\nCheck logs: tail -f ~/.local/share/opensrc/logs/opensrc-mcp.log");
+  console.log("\nCheck logs: tail -f ~/.opensrc/logs/opensrc-mcp.log");
 
   server.kill();
   process.exit(0);

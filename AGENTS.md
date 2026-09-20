@@ -18,11 +18,11 @@ src/
   executor.ts       # VM sandbox for agent code execution
   errors.ts         # Tagged error types (better-result)
   types.ts          # Core interfaces (Source, FileEntry, TreeNode, etc.)
-  sources.ts        # sources.json read/write via opensrc lib
+  sources.ts        # sources.json parsing and opensrc CLI adapter
   logger.ts         # JSON file logger to ~/.opensrc/logs/
   config.ts         # Global paths (opensrc dir, logs)
   truncate.ts       # Output size limiting
-opensrc/            # Runtime data (fetched sources) - gitignored
+~/.opensrc/         # Runtime data (fetched sources) - outside the repo
 ```
 
 ## WHERE TO LOOK
@@ -32,7 +32,7 @@ opensrc/            # Runtime data (fetched sources) - gitignored
 | Add new tool | `server.ts` | Single `execute` tool pattern |
 | Modify API | `api/opensrc.ts` | All ops exposed to sandbox |
 | Error handling | `errors.ts` | TaggedError pattern |
-| Source persistence | `sources.ts` | JSON at ~/.local/share/opensrc/ |
+| Source persistence | `sources.ts` | Global index at `~/.opensrc/sources.json` |
 | Add new type | `types.ts` | Core interfaces |
 
 ## CODE MAP
@@ -80,6 +80,6 @@ node test-mcp.mjs # integration test (spawns server)
 
 - **Global state**: Sources list is module singleton
 - **Codemode pattern**: LLMs write JS, server executes, only results return
-- **Graceful shutdown**: SIGINT/SIGTERM write sources
-- **XDG paths**: Data stored in ~/.local/share/opensrc/, logs in ~/.opensrc/logs/
+- **Graceful shutdown**: SIGINT/SIGTERM exits without rewriting the opensrc index
+- **Cache path**: Data stored in ~/.opensrc/, logs in ~/.opensrc/logs/, and `$OPENSRC_HOME` overrides the cache
 - **Import JSON assertion**: Uses `with { type: "json" }` (stage 3 proposal)

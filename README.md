@@ -18,6 +18,8 @@ npm install -g opensrc-mcp
 npx opensrc-mcp
 ```
 
+Node.js 24 or newer is required.
+
 ## OpenCode Configuration
 
 Add to your OpenCode config (`~/.config/opencode/config.json` or project `opencode.json`):
@@ -140,23 +142,18 @@ async () => opensrc.clean({ npm: true })
 
 ## Storage
 
-Sources are stored globally at `~/.local/share/opensrc/` (XDG compliant):
+Sources are stored globally at `~/.opensrc/`:
 
 ```
-~/.local/share/opensrc/
+~/.opensrc/
 ├── sources.json           # Index of fetched sources
-├── packages/              # npm/pypi/crates packages
-│   └── zod/
-│       ├── src/
-│       ├── package.json
-│       └── ...
-└── repos/                 # GitHub repos
+└── repos/                 # Cached package and repository sources
     └── github.com/
         └── vercel/
             └── ai/
 ```
 
-Override with `$OPENSRC_DIR` or `$XDG_DATA_HOME`.
+Override the cache location with `$OPENSRC_HOME`.
 
 ## How It Works
 
